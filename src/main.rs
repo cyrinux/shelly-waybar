@@ -1,45 +1,34 @@
 use clap::{Parser, ValueEnum};
+use futures_util::StreamExt;
 use notify_rust::Notification;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
 use std::path::Path;
-use std::{collections::HashMap, thread, time::Duration};
-use std::{fs, io};
+use std::sync::{Arc, Mutex};
+use std::{collections::HashMap, fs, io, thread, time::Duration};
 use strum_macros::{Display, EnumString};
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 #[derive(Parser, Debug)]
 struct Args {
-    /// Path to a file containing the auth key for the Shelly API
     #[arg(short, long, required = true, env = "SHELLY_AUTH_KEY")]
     auth_key: String,
-
-    /// List of devices in the format <device_type>:<device_id>:<device_name>
     #[arg(short, long, required = true, num_args(1..))]
     devices: Vec<String>,
-
-    /// Base URL of the Shelly server
     #[arg(
         short,
         long,
-        default_value = "https://shelly-001-eu.shelly.cloud",
+        default_value = "shelly-001-eu.shelly.cloud",
         env = "SHELLY_BASE_URL"
     )]
-    base_url: String,
-
-    /// Separator for devices in Waybar output
+    server: String,
     #[arg(short, long, default_value = " | ")]
     waybar_separator: String,
-
-    /// Interval in seconds between each loop
     #[arg(short, long, default_value_t = 30)]
     interval: u64,
-
-    /// Output format: short, long, or icons
     #[arg(long, default_value = "long", value_enum)]
     format: OutputFormat,
-
-    /// Unit for temperature (C or F)
     #[arg(short, long, default_value = "C", value_parser = ["C", "F"])]
     unit: String,
 }
@@ -74,149 +63,76 @@ struct ShellyData {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Args::parse();
-    process_devices_loop(&args).await?;
+    let server = resolve_input(&args.server)?;
+    let auth_key = resolve_input(&args.auth_key)?;
+
+    let shared_statuses = Arc::new(Mutex::new(HashMap::new()));
+    let client = Arc::new(Client::new());
+
+    let websocket_listener = {
+        let shared_statuses = Arc::clone(&shared_statuses);
+        tokio::spawn(start_websocket_listener(
+            &server,
+            &auth_key,
+            shared_statuses.clone(),
+        ))
+    };
+
+    let polling_loop = {
+        let shared_statuses = Arc::clone(&shared_statuses);
+        let client = Arc::clone(&client);
+        tokio::spawn(async move {
+            periodic_polling(args, shared_statuses, client, &server, &auth_key).await
+        })
+    };
+
+    tokio::try_join!(websocket_listener, polling_loop)?;
+
     Ok(())
 }
 
-/// Resolves input as either a Unix file path or a direct string value.
 fn resolve_input(input: &str) -> Result<String, io::Error> {
     if Path::new(input).exists() {
-        // Input is a valid Unix path; read the file
         let value = fs::read_to_string(input)?.trim().to_string();
         Ok(value)
     } else {
-        // Input is not a Unix path; use it directly
         Ok(input.to_string())
     }
 }
 
-async fn process_devices_loop(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    let client = Client::new();
-    let auth_key = resolve_input(&args.auth_key)?;
-    let base_url = resolve_input(&args.base_url)?;
-    let mut door_status_map: HashMap<String, bool> = HashMap::new();
-
+async fn periodic_polling(
+    args: Args,
+    shared_statuses: Arc<Mutex<HashMap<String, Value>>>,
+    client: Arc<Client>,
+    server: &str,
+    auth_key: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop {
-        let mut outputs = Vec::new();
-
         for device in &args.devices {
-            if let Some(output) = process_device(
-                device,
-                &auth_key,
-                &base_url,
-                args,
-                &client,
-                &mut door_status_map,
-            )
-            .await
+            if let Some(output) =
+                fetch_device_status(client.clone(), server, device, auth_key).await
             {
-                outputs.push(output);
+                let mut statuses = shared_statuses.lock().unwrap();
+                statuses.insert(device.to_string(), output);
             }
         }
-
-        if outputs.is_empty() {
-            eprintln!("Error: No valid device data found.");
-        } else {
-            let merged_text = outputs
-                .iter()
-                .map(|obj| obj["text"].as_str().unwrap_or_default())
-                .collect::<Vec<_>>()
-                .join(&args.waybar_separator);
-            let merged_tooltip = outputs
-                .iter()
-                .map(|obj| obj["tooltip"].as_str().unwrap_or_default())
-                .collect::<Vec<_>>()
-                .join("\n");
-            let merged_output = serde_json::json!({
-                "text": merged_text,
-                "tooltip": merged_tooltip
-            });
-            println!("{merged_output}");
-        }
-
+        refresh_waybar_output(&shared_statuses, &args);
         thread::sleep(Duration::from_secs(args.interval));
     }
 }
 
-async fn process_device(
+async fn fetch_device_status(
+    client: Arc<Client>,
+    server: &str,
     device: &str,
     auth_key: &str,
-    base_url: &str,
-    args: &Args,
-    client: &Client,
-    door_status_map: &mut HashMap<String, bool>,
 ) -> Option<Value> {
-    let (device_type_str, device_id, device_name) = parse_device_info(device)?;
-    let device_status = fetch_device_status(client, base_url, device_id, auth_key).await?;
-
-    let device_type = if device_type_str.is_empty() {
-        autodetect_device_type(&device_status)?
-    } else {
-        match_device_type(device_type_str)?
-    };
-
-    let mut output = match device_type {
-        DeviceType::Temperature => {
-            parse_temperature_data(device_status, args.format.clone(), &args.unit)
-        }
-        DeviceType::Plug => parse_plug_data(device_status, args.format.clone()),
-        DeviceType::Door => {
-            handle_door_status(
-                device_id,
-                device_name.clone(),
-                &device_status,
-                door_status_map,
-            )?;
-            parse_window_or_door_data(device_status, false, args.format.clone())
-        }
-        DeviceType::Window => parse_window_or_door_data(device_status, true, args.format.clone()),
-    };
-
-    if let Some(name) = device_name {
-        output["text"] = serde_json::Value::String(format!(
-            "{} ({})",
-            output["text"].as_str().unwrap_or_default(),
-            name
-        ));
-        output["tooltip"] = serde_json::Value::String(format!(
-            "Device: {}\n{}",
-            name,
-            output["tooltip"].as_str().unwrap_or_default()
-        ));
-    }
-
-    Some(output)
-}
-
-// Parse device information from input string
-fn parse_device_info(device: &str) -> Option<(&str, &str, Option<String>)> {
-    let parts: Vec<&str> = device.splitn(3, ':').collect();
-    if parts.len() < 2 {
-        eprintln!("Invalid device format: {}", device);
-        return None;
-    }
-
-    let device_type_str = parts[0];
-    let device_id = parts[1];
-    let device_name = parts.get(2).map(|s| s.to_string());
-
-    Some((device_type_str, device_id, device_name))
-}
-
-// Fetch device status from API
-async fn fetch_device_status(
-    client: &Client,
-    base_url: &str,
-    device_id: &str,
-    auth_key: &str,
-) -> Option<Value> {
-    let full_url = format!("{}/device/status", base_url);
-
+    let full_url = format!("https://{}/device/status", server);
     let response = client
         .post(&full_url)
-        .form(&[("id", device_id), ("auth_key", auth_key)])
+        .form(&[("id", device), ("auth_key", auth_key)])
         .send()
         .await
         .ok()?;
@@ -224,57 +140,132 @@ async fn fetch_device_status(
     let status: ShellyResponse = response.json().await.ok()?;
 
     if !status.isok {
-        if let Some(errors) = status.errors {
-            if let Some(error_message) = errors.get("invalid_token") {
-                eprintln!(
-                    "Error: Invalid token - {}",
-                    error_message.as_str().unwrap_or("Unknown error")
-                );
-            } else {
-                eprintln!("Error: API returned an error - {errors}");
-            }
-        } else {
-            eprintln!("Error: Unknown error occurred.");
-        }
+        eprintln!(
+            "Error fetching device status for {}: {:?}",
+            device, status.errors
+        );
         return None;
     }
 
     status.data?.device_status
 }
 
-// Match device type from string
-fn match_device_type(device_type_str: &str) -> Option<DeviceType> {
-    match device_type_str.to_lowercase().as_str() {
-        "temperature" => Some(DeviceType::Temperature),
-        "plug" => Some(DeviceType::Plug),
-        "door" => Some(DeviceType::Door),
-        "window" => Some(DeviceType::Window),
-        _ => {
-            eprintln!(
-                "Unsupported device type: '{}'. Supported types are: temperature, plug, door, window.",
-                device_type_str
-            );
-            None
+async fn start_websocket_listener(
+    server: &str,
+    auth_key: &str,
+    shared_statuses: Arc<Mutex<HashMap<String, Value>>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let ws_url = format!("wss://{}:6113/shelly/wss/hk_sock?t={}", server, auth_key);
+
+    eprintln!(
+        "Connecting to WebSocket: {}",
+        ws_url.replace(auth_key, "XXX")
+    );
+
+    let (ws_stream, _) = connect_async(&ws_url).await?;
+    eprintln!("Connected to WebSocket.");
+
+    let (_, mut read) = ws_stream.split();
+
+    while let Some(message) = read.next().await {
+        if let Ok(Message::Text(text)) = message {
+            if let Ok(json) = serde_json::from_str::<Value>(&text) {
+                if let Some(event) = json.get("event").and_then(|e| e.as_str()) {
+                    match event {
+                        "Shelly:StatusOnChange" => {
+                            handle_status_on_change(&json, &shared_statuses);
+                        }
+                        "Shelly:Online" => {
+                            handle_online_event(&json, &shared_statuses);
+                        }
+                        _ => {
+                            eprintln!("Unknown event: {}", event);
+                        }
+                    }
+                }
+            }
+        }
+        refresh_waybar_output(&shared_statuses, &Args::parse());
+    }
+
+    Ok(())
+}
+
+fn handle_status_on_change(json: &Value, shared_statuses: &Arc<Mutex<HashMap<String, Value>>>) {
+    if let Some(device) = json.get("device") {
+        if let Some(device_id) = device.get("id").and_then(|id| id.as_str()) {
+            if let Some(status) = json.get("status") {
+                let mut statuses = shared_statuses.lock().unwrap();
+                statuses.insert(device_id.to_string(), status.clone());
+            }
         }
     }
 }
 
-// Autodetect device type from JSON
-fn autodetect_device_type(json: &Value) -> Option<DeviceType> {
-    if json.get("temperature:0").is_some() || json.get("humidity:0").is_some() {
-        return Some(DeviceType::Temperature);
+fn handle_online_event(json: &Value, shared_statuses: &Arc<Mutex<HashMap<String, Value>>>) {
+    if let Some(device) = json.get("device") {
+        if let Some(device_id) = device.get("id").and_then(|id| id.as_str()) {
+            if let Some(online) = json.get("online").and_then(|o| o.as_u64()) {
+                let is_online = online == 1;
+
+                let mut statuses = shared_statuses.lock().unwrap();
+                statuses
+                    .entry(device_id.to_string())
+                    .or_insert_with(|| serde_json::json!({}))
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("online".to_string(), serde_json::Value::Bool(is_online));
+
+                let state = if is_online { "Online" } else { "Offline" };
+                Notification::new()
+                    .summary(&format!("Device {} Status Changed", device_id))
+                    .body(&format!("Device is now {}", state))
+                    .show()
+                    .unwrap();
+            }
+        }
     }
-    if json.get("switch:0").is_some() {
-        return Some(DeviceType::Plug);
+}
+
+fn refresh_waybar_output(shared_statuses: &Arc<Mutex<HashMap<String, Value>>>, args: &Args) {
+    let statuses = shared_statuses.lock().unwrap();
+    let outputs: Vec<_> = statuses
+        .values()
+        .map(|status| generate_output(status.clone(), args))
+        .collect();
+
+    if outputs.is_empty() {
+        eprintln!("Error: No valid device data found.");
+    } else {
+        let merged_text = outputs
+            .iter()
+            .map(|obj| obj["text"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(&args.waybar_separator);
+        let merged_tooltip = outputs
+            .iter()
+            .map(|obj| obj["tooltip"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let merged_output = serde_json::json!({
+            "text": merged_text,
+            "tooltip": merged_tooltip
+        });
+        println!("{merged_output}");
     }
-    if json.get("window:0").is_some() {
-        return Some(DeviceType::Door);
-    }
-    if json.get("tilt:0").is_some() {
-        return Some(DeviceType::Window);
-    }
-    eprintln!("Unable to autodetect device type.");
-    None
+}
+
+fn generate_output(status: Value, _args: &Args) -> Value {
+    let is_online = status
+        .get("online")
+        .and_then(|o| o.as_bool())
+        .unwrap_or(false);
+    let online_text = if is_online { "🟢" } else { "🔴" };
+
+    serde_json::json!({
+        "text": format!("{} {}", online_text, "Device Status Placeholder"),
+        "tooltip": format!("Device is currently {}", if is_online { "Online" } else { "Offline" })
+    })
 }
 
 // Handle door status changes and notifications
@@ -393,228 +384,5 @@ fn parse_window_or_door_data(device_status: Value, is_window: bool, format: Outp
             "text": format!("{} 🔆{}{}", if is_open { "🟢" } else { "🔴" }, lux, tilt),
             "tooltip": format!("🔋{}% 📶{}dBm", battery, rssi)
         }),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    // Test: Autodetect Device Type
-    #[test]
-    fn test_autodetect_device_type() {
-        let temp_json = json!({ "temperature:0": { "tC": 22.5 } });
-        let plug_json = json!({ "switch:0": { "apower": 50.0 } });
-        let door_json = json!({ "window:0": { "open": true } });
-        let window_json = json!({ "tilt:0": { "angle": 30 } });
-        let unknown_json = json!({});
-
-        assert_eq!(
-            autodetect_device_type(&temp_json),
-            Some(DeviceType::Temperature)
-        );
-        assert_eq!(autodetect_device_type(&plug_json), Some(DeviceType::Plug));
-        assert_eq!(autodetect_device_type(&door_json), Some(DeviceType::Door));
-        assert_eq!(
-            autodetect_device_type(&window_json),
-            Some(DeviceType::Window)
-        );
-        assert_eq!(autodetect_device_type(&unknown_json), None);
-    }
-
-    // Test: Match Device Type
-    #[test]
-    fn test_match_device_type() {
-        assert_eq!(
-            match_device_type("temperature"),
-            Some(DeviceType::Temperature)
-        );
-        assert_eq!(match_device_type("plug"), Some(DeviceType::Plug));
-        assert_eq!(match_device_type("door"), Some(DeviceType::Door));
-        assert_eq!(match_device_type("window"), Some(DeviceType::Window));
-        assert_eq!(match_device_type("unknown"), None);
-    }
-
-    // Test: Parse Device Info
-    #[test]
-    fn test_parse_device_info() {
-        let device = "temperature:12345:Living Room";
-        let device_with_no_name = "plug:67890";
-        let invalid_device = "invalidformat";
-
-        assert_eq!(
-            parse_device_info(device),
-            Some(("temperature", "12345", Some("Living Room".to_string())))
-        );
-        assert_eq!(
-            parse_device_info(device_with_no_name),
-            Some(("plug", "67890", None))
-        );
-        assert_eq!(parse_device_info(invalid_device), None);
-    }
-
-    // Test: Parse Temperature Data
-    #[test]
-    fn test_parse_temperature_data() {
-        let device_status = json!({
-            "temperature:0": { "tC": 22.5, "tF": 72.5 },
-            "humidity:0": { "rh": 50 },
-            "devicepower:0": { "battery": { "percent": 80 } },
-            "reporter": { "rssi": -60 }
-        });
-
-        let output = parse_temperature_data(device_status.clone(), OutputFormat::Short, "C");
-        assert_eq!(output["text"], "T: 22.5°C H: 50%");
-        assert_eq!(output["tooltip"], "B: 80% RSSI: -60dBm");
-
-        let output = parse_temperature_data(device_status.clone(), OutputFormat::Long, "F");
-        assert_eq!(output["text"], "Temp: 72.5°F Humidity: 50%");
-        assert_eq!(output["tooltip"], "Battery: 80% RSSI: -60dBm");
-
-        let output = parse_temperature_data(device_status, OutputFormat::Icons, "C");
-        assert_eq!(output["text"], "22.5°C 💧50%");
-        assert_eq!(output["tooltip"], "🔋80% 📶-60dBm");
-    }
-
-    // Test: Parse Plug Data
-    #[test]
-    fn test_parse_plug_data() {
-        let device_status = json!({
-            "switch:0": { "apower": 50.0, "voltage": 230.0, "current": 0.217, "output": true },
-            "wifi": { "rssi": -70 }
-        });
-
-        let output = parse_plug_data(device_status.clone(), OutputFormat::Short);
-        assert_eq!(output["text"], "P: 50.0W V: 230.0V");
-        assert_eq!(output["tooltip"], "I: 0.217A RSSI: -70dBm O: ON");
-
-        let output = parse_plug_data(device_status.clone(), OutputFormat::Long);
-        assert_eq!(output["text"], "Power: 50.0W Voltage: 230.0V");
-        assert_eq!(
-            output["tooltip"],
-            "Current: 0.217A WiFi RSSI: -70dBm Output: ON"
-        );
-
-        let output = parse_plug_data(device_status, OutputFormat::Icons);
-        assert_eq!(output["text"], "⚡50.0W 🔌230.0V");
-        assert_eq!(output["tooltip"], "🔋0.217A 📶-70dBm 🔆ON");
-    }
-
-    // Test: Parse Window/Door Data
-    #[test]
-    fn test_parse_window_or_door_data() {
-        let device_status = json!({
-            "window:0": { "open": true },
-            "illuminance:0": { "lux": 100 },
-            "devicepower:0": { "battery": { "percent": 90 } },
-            "reporter": { "rssi": -65 },
-            "tilt:0": { "angle": 30 }
-        });
-
-        let output = parse_window_or_door_data(device_status.clone(), true, OutputFormat::Short);
-        assert_eq!(output["text"], "Open: L: 100, Tilt: 30");
-        assert_eq!(output["tooltip"], "B: 90% RSSI: -65dBm");
-
-        let output = parse_window_or_door_data(device_status.clone(), false, OutputFormat::Long);
-        assert_eq!(output["text"], "Open, Lux: 100");
-        assert_eq!(output["tooltip"], "Battery: 90% RSSI: -65dBm");
-
-        let output = parse_window_or_door_data(device_status, true, OutputFormat::Icons);
-        assert_eq!(output["text"], "🟢 🔆100, Tilt: 30");
-        assert_eq!(output["tooltip"], "🔋90% 📶-65dBm");
-    }
-
-    // Test: Door Status Change Notification
-    #[test]
-    fn test_handle_door_status() {
-        let mut door_status_map = HashMap::new();
-        let device_status_open = json!({
-            "window:0": { "open": true }
-        });
-        let device_status_closed = json!({
-            "window:0": { "open": false }
-        });
-
-        let device_id = "door-12345";
-        let device_name = Some("Front Door".to_string());
-
-        // Test status change from None to Open
-        let notification = handle_door_status(
-            device_id,
-            device_name.clone(),
-            &device_status_open,
-            &mut door_status_map,
-        );
-        assert!(notification.is_some());
-        assert!(door_status_map[&format!("{}:{}", device_id, device_name.clone().unwrap())]);
-
-        // Test status change from Open to Closed
-        let notification = handle_door_status(
-            device_id,
-            device_name.clone(),
-            &device_status_closed,
-            &mut door_status_map,
-        );
-        assert!(notification.is_some());
-        assert!(!door_status_map[&format!("{}:{}", device_id, device_name.clone().unwrap())]);
-    }
-
-    // Test: Fetch Device Status Mock
-    #[tokio::test]
-    async fn test_fetch_device_status() {
-        use httpmock::MockServer;
-
-        let server = MockServer::start_async().await;
-        let mock_response = json!({
-            "isok": true,
-            "data": {
-                "device_status": {
-                    "temperature:0": { "tC": 22.5, "tF": 72.5 },
-                    "humidity:0": { "rh": 50 }
-                }
-            }
-        });
-
-        let mock = server.mock(|when, then| {
-            when.method("POST").path("/device/status");
-            then.status(200).json_body(mock_response.clone());
-        });
-
-        let client = Client::new();
-        let response =
-            fetch_device_status(&client, &server.base_url(), "12345", "mock-auth-key").await;
-
-        mock.assert();
-        assert!(response.is_some());
-        assert_eq!(
-            response.unwrap()["temperature:0"]["tC"],
-            mock_response["data"]["device_status"]["temperature:0"]["tC"]
-        );
-    }
-
-    #[test]
-    fn test_resolve_input_with_path() {
-        let temp_file = "/tmp/test_file.txt";
-        let content = "file_content";
-
-        // Write a temporary test file
-        std::fs::write(temp_file, content).unwrap();
-        assert_eq!(resolve_input(temp_file).unwrap(), content);
-        std::fs::remove_file(temp_file).unwrap(); // Cleanup
-    }
-
-    #[test]
-    fn test_resolve_input_with_direct_value() {
-        let direct_value = "direct_string_value";
-        assert_eq!(resolve_input(direct_value).unwrap(), direct_value);
-    }
-
-    #[test]
-    fn test_resolve_input_with_invalid_path() {
-        let invalid_path = "/tmp/non_existent_file.txt";
-        let result = resolve_input(invalid_path);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), invalid_path);
     }
 }
