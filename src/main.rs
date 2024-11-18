@@ -4,13 +4,14 @@ use notify_rust::Notification;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
-use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::{collections::HashMap, fs, io, thread, time::Duration};
+use std::{collections::HashMap, thread, time::Duration};
+use std::{error::Error, path::Path};
+use std::{fs, io};
 use strum_macros::{Display, EnumString};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 struct Args {
     #[arg(short, long, required = true, env = "SHELLY_AUTH_KEY")]
     auth_key: String,
@@ -62,37 +63,97 @@ struct ShellyData {
     device_status: Option<Value>,
 }
 
+async fn fetch_access_token(
+    server: &str,
+    client_id: &str,
+    auth_key: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let full_url = format!("https://{}/oauth/auth", server);
+
+    let params = [
+        ("client_id", client_id),
+        ("grant_type", "code"),
+        ("code", auth_key),
+    ];
+
+    let client = reqwest::Client::new();
+    let response = client.post(&full_url).form(&params).send().await?;
+
+    let json: Value = response.json().await?;
+    if let Some(access_token) = json.get("access_token").and_then(|t| t.as_str()) {
+        Ok(access_token.to_string())
+    } else {
+        Err("Failed to retrieve access token".into())
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args = Args::parse();
-    let server = resolve_input(&args.server)?;
-    let auth_key = resolve_input(&args.auth_key)?;
+
+    // Explicitly map resolve_input errors
+    let server =
+        resolve_input(&args.server).map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+    let auth_key =
+        resolve_input(&args.auth_key).map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
     let shared_statuses = Arc::new(Mutex::new(HashMap::new()));
     let client = Arc::new(Client::new());
 
+    // Fetch the access token
+    let client_id = "shelly-diy"; // Change this if you have a specific client ID
+    let access_token = fetch_access_token(&server, client_id, &auth_key).await?;
+
+    println!("Access token retrieved successfully.");
+
     let websocket_listener = {
         let shared_statuses = Arc::clone(&shared_statuses);
-        tokio::spawn(start_websocket_listener(
-            &server,
-            &auth_key,
-            shared_statuses.clone(),
-        ))
+        let websocket_server = server.clone();
+        let websocket_args = args.clone();
+        tokio::spawn(async move {
+            start_websocket_listener(
+                &websocket_server,
+                &access_token,
+                &websocket_args,
+                shared_statuses,
+            )
+            .await
+        })
     };
 
     let polling_loop = {
         let shared_statuses = Arc::clone(&shared_statuses);
-        let client = Arc::clone(&client);
+        let polling_server = server.clone();
+        let polling_auth_key = auth_key.clone();
+        let polling_args = args.clone();
+        let polling_client = Arc::clone(&client);
         tokio::spawn(async move {
-            periodic_polling(args, shared_statuses, client, &server, &auth_key).await
+            periodic_polling(
+                polling_args,
+                shared_statuses,
+                polling_client,
+                &polling_server,
+                &polling_auth_key,
+            )
+            .await
         })
     };
 
-    tokio::try_join!(websocket_listener, polling_loop)?;
+    // Handle `tokio::try_join!` result
+    match tokio::try_join!(websocket_listener, polling_loop) {
+        Ok(_) => {
+            println!("Both tasks completed successfully.");
+        }
+        Err(e) => {
+            eprintln!("Error occurred: {}", e);
+            return Err(Box::new(e) as Box<dyn Error + Send + Sync>);
+        }
+    }
 
     Ok(())
 }
 
+/// Resolves input as either a Unix file path or a direct string value.
 fn resolve_input(input: &str) -> Result<String, io::Error> {
     if Path::new(input).exists() {
         let value = fs::read_to_string(input)?.trim().to_string();
@@ -129,10 +190,19 @@ async fn fetch_device_status(
     device: &str,
     auth_key: &str,
 ) -> Option<Value> {
+    // Parse device string to extract device_id
+    let device_id = match device.split(':').nth(1) {
+        Some(id) => id,
+        None => {
+            eprintln!("Invalid device format: {}", device);
+            return None;
+        }
+    };
+
     let full_url = format!("https://{}/device/status", server);
     let response = client
         .post(&full_url)
-        .form(&[("id", device), ("auth_key", auth_key)])
+        .form(&[("id", device_id), ("auth_key", auth_key)])
         .send()
         .await
         .ok()?;
@@ -142,7 +212,7 @@ async fn fetch_device_status(
     if !status.isok {
         eprintln!(
             "Error fetching device status for {}: {:?}",
-            device, status.errors
+            device_id, status.errors
         );
         return None;
     }
@@ -153,6 +223,7 @@ async fn fetch_device_status(
 async fn start_websocket_listener(
     server: &str,
     auth_key: &str,
+    args: &Args,
     shared_statuses: Arc<Mutex<HashMap<String, Value>>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let ws_url = format!("wss://{}:6113/shelly/wss/hk_sock?t={}", server, auth_key);
@@ -173,7 +244,7 @@ async fn start_websocket_listener(
                 if let Some(event) = json.get("event").and_then(|e| e.as_str()) {
                     match event {
                         "Shelly:StatusOnChange" => {
-                            handle_status_on_change(&json, &shared_statuses);
+                            handle_status_on_change(&json, &shared_statuses, args);
                         }
                         "Shelly:Online" => {
                             handle_online_event(&json, &shared_statuses);
@@ -189,17 +260,6 @@ async fn start_websocket_listener(
     }
 
     Ok(())
-}
-
-fn handle_status_on_change(json: &Value, shared_statuses: &Arc<Mutex<HashMap<String, Value>>>) {
-    if let Some(device) = json.get("device") {
-        if let Some(device_id) = device.get("id").and_then(|id| id.as_str()) {
-            if let Some(status) = json.get("status") {
-                let mut statuses = shared_statuses.lock().unwrap();
-                statuses.insert(device_id.to_string(), status.clone());
-            }
-        }
-    }
 }
 
 fn handle_online_event(json: &Value, shared_statuses: &Arc<Mutex<HashMap<String, Value>>>) {
@@ -231,7 +291,7 @@ fn refresh_waybar_output(shared_statuses: &Arc<Mutex<HashMap<String, Value>>>, a
     let statuses = shared_statuses.lock().unwrap();
     let outputs: Vec<_> = statuses
         .values()
-        .map(|status| generate_output(status.clone(), args))
+        .map(|status| generate_output(status.clone(), args, None))
         .collect();
 
     if outputs.is_empty() {
@@ -239,14 +299,18 @@ fn refresh_waybar_output(shared_statuses: &Arc<Mutex<HashMap<String, Value>>>, a
     } else {
         let merged_text = outputs
             .iter()
+            .filter_map(|obj| obj.as_ref()) // Ensure we have non-None objects
             .map(|obj| obj["text"].as_str().unwrap_or_default())
             .collect::<Vec<_>>()
             .join(&args.waybar_separator);
+
         let merged_tooltip = outputs
             .iter()
+            .filter_map(|obj| obj.as_ref()) // Ensure we have non-None objects
             .map(|obj| obj["tooltip"].as_str().unwrap_or_default())
             .collect::<Vec<_>>()
             .join("\n");
+
         let merged_output = serde_json::json!({
             "text": merged_text,
             "tooltip": merged_tooltip
@@ -255,46 +319,25 @@ fn refresh_waybar_output(shared_statuses: &Arc<Mutex<HashMap<String, Value>>>, a
     }
 }
 
-fn generate_output(status: Value, _args: &Args) -> Value {
-    let is_online = status
-        .get("online")
-        .and_then(|o| o.as_bool())
-        .unwrap_or(false);
-    let online_text = if is_online { "🟢" } else { "🔴" };
+fn generate_output(status: Value, args: &Args, device_type: Option<DeviceType>) -> Option<Value> {
+    let device_type = device_type.or_else(|| autodetect_device_type(&status))?;
 
-    serde_json::json!({
-        "text": format!("{} {}", online_text, "Device Status Placeholder"),
-        "tooltip": format!("Device is currently {}", if is_online { "Online" } else { "Offline" })
-    })
-}
-
-// Handle door status changes and notifications
-fn handle_door_status(
-    device_id: &str,
-    device_name: Option<String>,
-    device_status: &Value,
-    door_status_map: &mut HashMap<String, bool>,
-) -> Option<()> {
-    let is_open = device_status["window:0"]["open"].as_bool().unwrap_or(false);
-    let status_key = format!("{}:{}", device_id, device_name.clone().unwrap_or_default());
-
-    if let Some(prev_status) = door_status_map.get(&status_key) {
-        if *prev_status != is_open {
-            let state = if is_open { "Open" } else { "Closed" };
-            let name = device_name.unwrap_or_else(|| "Unnamed Door".to_string());
-            Notification::new()
-                .summary(&format!("Door Status Changed: {}", name))
-                .body(&format!("The door is now {}", state))
-                .show()
-                .ok()?;
-        }
+    match device_type {
+        DeviceType::Temperature => Some(parse_temperature_data(
+            status,
+            args.format.clone(),
+            &args.unit,
+        )),
+        DeviceType::Plug => Some(parse_plug_data(status, args.format.clone())),
+        DeviceType::Door => Some(parse_window_or_door_data(
+            status,
+            false,
+            args.format.clone(),
+        )),
+        DeviceType::Window => Some(parse_window_or_door_data(status, true, args.format.clone())),
     }
-
-    door_status_map.insert(status_key, is_open);
-    Some(())
 }
 
-// Parsing functions remain the same
 fn parse_temperature_data(device_status: Value, format: OutputFormat, unit: &str) -> Value {
     let temp_c = device_status["temperature:0"]["tC"].as_f64().unwrap_or(0.0);
     let temp_f = device_status["temperature:0"]["tF"].as_f64().unwrap_or(0.0);
@@ -384,5 +427,61 @@ fn parse_window_or_door_data(device_status: Value, is_window: bool, format: Outp
             "text": format!("{} 🔆{}{}", if is_open { "🟢" } else { "🔴" }, lux, tilt),
             "tooltip": format!("🔋{}% 📶{}dBm", battery, rssi)
         }),
+    }
+}
+
+fn process_device_status(
+    device_type: DeviceType,
+    status: Value,
+    format: OutputFormat,
+    unit: &str,
+    is_window: bool,
+) -> Value {
+    match device_type {
+        DeviceType::Temperature => parse_temperature_data(status, format, unit),
+        DeviceType::Plug => parse_plug_data(status, format),
+        DeviceType::Door | DeviceType::Window => {
+            parse_window_or_door_data(status, is_window, format)
+        }
+    }
+}
+
+fn handle_status_on_change(
+    json: &Value,
+    shared_statuses: &Arc<Mutex<HashMap<String, Value>>>,
+    args: &Args,
+) {
+    if let Some(device) = json.get("device") {
+        if let Some(device_id) = device.get("id").and_then(|id| id.as_str()) {
+            if let Some(status) = json.get("status") {
+                let device_type = autodetect_device_type(status);
+
+                if let Some(device_type) = device_type {
+                    let parsed_data = process_device_status(
+                        device_type,
+                        status.clone(),
+                        args.format.clone(),
+                        &args.unit,
+                        false,
+                    );
+                    let mut statuses = shared_statuses.lock().unwrap();
+                    statuses.insert(device_id.to_string(), parsed_data);
+                }
+            }
+        }
+    }
+}
+
+fn autodetect_device_type(status: &Value) -> Option<DeviceType> {
+    if status.get("temperature:0").is_some() {
+        Some(DeviceType::Temperature)
+    } else if status.get("switch:0").is_some() {
+        Some(DeviceType::Plug)
+    } else if status.get("window:0").is_some() {
+        Some(DeviceType::Door)
+    } else if status.get("tilt:0").is_some() {
+        Some(DeviceType::Window)
+    } else {
+        None
     }
 }
