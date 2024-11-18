@@ -3,6 +3,7 @@ use notify_rust::Notification;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
+use std::path::Path;
 use std::{collections::HashMap, thread, time::Duration};
 use std::{fs, io};
 use strum_macros::{Display, EnumString};
@@ -10,7 +11,7 @@ use strum_macros::{Display, EnumString};
 #[derive(Parser, Debug)]
 struct Args {
     /// Path to a file containing the auth key for the Shelly API
-    #[arg(short, long, required = true)]
+    #[arg(short, long, required = true, env = "SHELLY_AUTH_KEY")]
     auth_key: String,
 
     /// List of devices in the format <device_type>:<device_id>:<device_name>
@@ -18,7 +19,12 @@ struct Args {
     devices: Vec<String>,
 
     /// Base URL of the Shelly server
-    #[arg(short, long, default_value = "https://shelly-001-eu.shelly.cloud")]
+    #[arg(
+        short,
+        long,
+        default_value = "https://shelly-001-eu.shelly.cloud",
+        env = "SHELLY_BASE_URL"
+    )]
     base_url: String,
 
     /// Separator for devices in Waybar output
@@ -74,22 +80,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn read_auth_key_from_file(file_path: &str) -> Result<String, io::Error> {
-    let key = fs::read_to_string(file_path)?.trim().to_string();
-    Ok(key)
+/// Resolves input as either a Unix file path or a direct string value.
+fn resolve_input(input: &str) -> Result<String, io::Error> {
+    if Path::new(input).exists() {
+        // Input is a valid Unix path; read the file
+        let value = fs::read_to_string(input)?.trim().to_string();
+        Ok(value)
+    } else {
+        // Input is not a Unix path; use it directly
+        Ok(input.to_string())
+    }
 }
 
 async fn process_devices_loop(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::new();
-    let auth_key = read_auth_key_from_file(&args.auth_key)?;
+    let auth_key = resolve_input(&args.auth_key)?;
+    let base_url = resolve_input(&args.base_url)?;
     let mut door_status_map: HashMap<String, bool> = HashMap::new();
 
     loop {
         let mut outputs = Vec::new();
 
         for device in &args.devices {
-            if let Some(output) =
-                process_device(device, &auth_key, args, &client, &mut door_status_map).await
+            if let Some(output) = process_device(
+                device,
+                &auth_key,
+                &base_url,
+                args,
+                &client,
+                &mut door_status_map,
+            )
+            .await
             {
                 outputs.push(output);
             }
@@ -112,7 +133,7 @@ async fn process_devices_loop(args: &Args) -> Result<(), Box<dyn std::error::Err
                 "text": merged_text,
                 "tooltip": merged_tooltip
             });
-            println!("{}", merged_output.to_string());
+            println!("{merged_output}");
         }
 
         thread::sleep(Duration::from_secs(args.interval));
@@ -122,12 +143,13 @@ async fn process_devices_loop(args: &Args) -> Result<(), Box<dyn std::error::Err
 async fn process_device(
     device: &str,
     auth_key: &str,
+    base_url: &str,
     args: &Args,
     client: &Client,
     door_status_map: &mut HashMap<String, bool>,
 ) -> Option<Value> {
     let (device_type_str, device_id, device_name) = parse_device_info(device)?;
-    let device_status = fetch_device_status(client, &args.base_url, device_id, auth_key).await?;
+    let device_status = fetch_device_status(client, base_url, device_id, auth_key).await?;
 
     let device_type = if device_type_str.is_empty() {
         autodetect_device_type(&device_status)?
