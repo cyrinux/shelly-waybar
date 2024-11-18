@@ -4,17 +4,18 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
 use std::{collections::HashMap, thread, time::Duration};
+use std::{fs, io};
 use strum_macros::{Display, EnumString};
 
 #[derive(Parser, Debug)]
 struct Args {
+    /// Path to a file containing the auth key for the Shelly API
+    #[arg(short, long, required = true)]
+    auth_key: String,
+
     /// List of devices in the format <device_type>:<device_id>:<device_name>
     #[arg(short, long, required = true, num_args(1..))]
     devices: Vec<String>,
-
-    /// Auth key for the Shelly API (can also be set via the SHELLY_AUTH_KEY environment variable)
-    #[arg(short, long, env = "SHELLY_AUTH_KEY")]
-    auth_key: String,
 
     /// Base URL of the Shelly server
     #[arg(short, long, default_value = "https://shelly-001-eu.shelly.cloud")]
@@ -73,16 +74,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// Main processing loop
+fn read_auth_key_from_file(file_path: &str) -> Result<String, io::Error> {
+    let key = fs::read_to_string(file_path)?.trim().to_string();
+    Ok(key)
+}
+
 async fn process_devices_loop(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::new();
+    let auth_key = read_auth_key_from_file(&args.auth_key)?;
     let mut door_status_map: HashMap<String, bool> = HashMap::new();
 
     loop {
         let mut outputs = Vec::new();
 
         for device in &args.devices {
-            if let Some(output) = process_device(device, args, &client, &mut door_status_map).await
+            if let Some(output) =
+                process_device(device, &auth_key, args, &client, &mut door_status_map).await
             {
                 outputs.push(output);
             }
@@ -105,23 +112,22 @@ async fn process_devices_loop(args: &Args) -> Result<(), Box<dyn std::error::Err
                 "text": merged_text,
                 "tooltip": merged_tooltip
             });
-            println!("{merged_output}");
+            println!("{}", merged_output.to_string());
         }
 
         thread::sleep(Duration::from_secs(args.interval));
     }
 }
 
-// Process a single device
 async fn process_device(
     device: &str,
+    auth_key: &str,
     args: &Args,
     client: &Client,
     door_status_map: &mut HashMap<String, bool>,
 ) -> Option<Value> {
     let (device_type_str, device_id, device_name) = parse_device_info(device)?;
-    let device_status =
-        fetch_device_status(client, &args.base_url, device_id, &args.auth_key).await?;
+    let device_status = fetch_device_status(client, &args.base_url, device_id, auth_key).await?;
 
     let device_type = if device_type_str.is_empty() {
         autodetect_device_type(&device_status)?
@@ -146,7 +152,6 @@ async fn process_device(
         DeviceType::Window => parse_window_or_door_data(device_status, true, args.format.clone()),
     };
 
-    // Add device name to output
     if let Some(name) = device_name {
         output["text"] = serde_json::Value::String(format!(
             "{} ({})",
