@@ -1,6 +1,6 @@
 [package]
 name = "shelly-waybar"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 authors = ["Cyrinux <crates@levis.name>"]
 description = "A Rust application to parse Shelly sensor data and output Waybar-compatible JSON."
