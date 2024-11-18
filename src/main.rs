@@ -592,4 +592,29 @@ mod tests {
             mock_response["data"]["device_status"]["temperature:0"]["tC"]
         );
     }
+
+    #[test]
+    fn test_resolve_input_with_path() {
+        let temp_file = "/tmp/test_file.txt";
+        let content = "file_content";
+
+        // Write a temporary test file
+        std::fs::write(temp_file, content).unwrap();
+        assert_eq!(resolve_input(temp_file).unwrap(), content);
+        std::fs::remove_file(temp_file).unwrap(); // Cleanup
+    }
+
+    #[test]
+    fn test_resolve_input_with_direct_value() {
+        let direct_value = "direct_string_value";
+        assert_eq!(resolve_input(direct_value).unwrap(), direct_value);
+    }
+
+    #[test]
+    fn test_resolve_input_with_invalid_path() {
+        let invalid_path = "/tmp/non_existent_file.txt";
+        let result = resolve_input(invalid_path);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), invalid_path);
+    }
 }
